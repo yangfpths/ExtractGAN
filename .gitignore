@@ -117,3 +117,6 @@ dmypy.json
 
 # special
 checkpoints/
+dataset/
+tmp.*
+dataset*

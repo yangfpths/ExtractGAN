@@ -1,11 +1,14 @@
-import time
+import itertools
 import os
+import time
+
 import torch
 import torch.nn as nn
-from torch.nn import init
-from torch.nn import functional as F
 import torchvision.models
 import torchvision.transforms as transforms
+from torch.nn import functional as F
+from torch.nn import init
+
 from options.train_options import TrainOptions
 
 
@@ -45,7 +48,7 @@ class Encoder(BaseModule):
         for nf in same_size_nf:
             model += [
                 padding_layer(1),
-                nn.Conv2d(last_nf, nf, kernel_size=3, padding=0, bias=use_bias),
+                nn.Conv2d(last_nf, nf, stride=2, kernel_size=3, padding=0, bias=use_bias),
                 norm_layer(nf),
                 nn.ReLU(inplace=True),
                 ]
@@ -73,8 +76,8 @@ class Decoder(BaseModule):
         for i, nf in enumerate(same_size_nf):
             next_nf = output_nc if i == len(same_size_nf) - 1 else same_size_nf[i + 1]
             model += [
-                padding_layer(1),
-                nn.ConvTranspose2d(nf, next_nf, kernel_size=3, padding=0, bias=use_bias),
+                # padding_layer(1),
+                nn.ConvTranspose2d(nf, next_nf, stride=2, kernel_size=3, padding=1, output_padding=1, bias=use_bias),
                 norm_layer(nf),
                 ]
             if i < len(same_size_nf) - 1:
@@ -294,14 +297,6 @@ class ExtractGANModel:
         if opt.resize_or_crop != 'scale_width':
             torch.backends.cudnn.benchmark = True
 
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomCrop(32, padding=12),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0),
-            transforms.ToTensor(),
-        ])
-
         self.vgg16 = self.get_pretrained_vgg()
         self.G = Generator(vgg=self.vgg16)
 
@@ -309,11 +304,17 @@ class ExtractGANModel:
             self.D = Discriminator(vgg=self.vgg16)
             self.criterionGAN = GANLoss(use_lsgan=not opt.no_lsgan).to(self.device)
             self.criterionCycle = torch.nn.L1Loss().to(self.device)
+            # self.criterionAE = torch.nn.L1Loss().to(self.device)
+            self.criterionAE = torch.nn.MSELoss().to(self.device)
             self.optimizer_G = torch.optim.Adam(filter(lambda p: p.requires_grad, self.G.parameters()),
                                                 lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(filter(lambda p: p.requires_grad, self.D.parameters()),
                                                 lr=opt.lr, betas=(opt.beta1, 0.999))
-        
+            self.optimizer_AE = torch.optim.Adam(itertools.chain(self.G.encoder.parameters(), self.G.decoder.parameters()),
+                                                lr=opt.lr_ae, betas=(opt.beta1, 0.999))
+            # self.optimizer_AE = torch.optim.Adam(self.G.parameters(),
+                                                # lr=opt.lr_ae, betas=(opt.beta1, 0.999))
+                                                   
         print('New ExtractGAN model initialized!')
 
     def get_pretrained_vgg(self):
@@ -349,16 +350,20 @@ class ExtractGANModel:
 
     def set_input(self, input):
         # The image that will be transfered, 224*224
-        self.ori_img = input[0]  
+        self.ori_img = input[0].to(self.device).requires_grad_(True)
         # The image in target style, 224*224
-        self.style_img = input[1]
+        self.style_img = input[1].to(self.device).requires_grad_(True)
         
         if self.isTrain:
             # Another image in target style for training D, 224*224
-            self.style_ref_img = input[2]
+            self.style_ref_img = input[2].to(self.device).requires_grad_(True)
         
         # Another image in ori_img's style for reconstruct ori_img, 224*224
-        self.style_ori_img = input[3]
+        self.style_ori_img = input[3].to(self.device).requires_grad_(True)
+
+    def set_ae_input(self, img):
+        # The image that will be transfered, 224*224
+        self.ori_img = img.to(self.device).requires_grad_(True)
 
     # set requies_grad=Fasle to avoid computation, keep vgg16 requires_grad=False
     def set_requires_grad(self, nets, requires_grad: bool):
@@ -371,9 +376,22 @@ class ExtractGANModel:
         for p in self.vgg16.parameters():
             p.requires_grad = False
 
+    def set_requires_grad_AE(self, requires_grad: bool):
+        for p in self.D.parameters():
+            p.requires_grad = False
+        for p in self.G.parameters():
+            p.requires_grad = False
+        for p in self.G.encoder.parameters():
+            p.requies_grad = requires_grad
+        for p in self.G.decoder.parameters():
+            p.requies_grad = requires_grad        
+
     def forward(self):
         self.stylized_img = self.G(self.ori_img, self.style_img)
         self.rec_img = self.G(self.stylized_img, self.style_ori_img)
+
+    def forward_AE(self):
+        self.ae_img = self.G.decoder(self.G.encoder(self.ori_img))
 
     def backward_G(self):
         self.loss_G_gen = self.criterionGAN(self.D(self.stylized_img, self.style_ref_img), True)
@@ -387,6 +405,10 @@ class ExtractGANModel:
         self.loss_D = (self.loss_D_same + self.loss_D_diff) * 0.5
         self.loss_D.backward()
 
+    def backward_AE(self):
+        self.loss_AE = self.criterionAE(self.ae_img, self.ori_img)
+        self.loss_AE.backward()
+
     def optimize_parameters(self):
         self.forward()
 
@@ -399,6 +421,16 @@ class ExtractGANModel:
         self.optimizer_D.zero_grad()
         self.backward_D()
         self.optimizer_D.step()
+    
+    def optimize_parameters_AE(self):
+        # self.set_requires_grad_AE(True) wrong!
+        self.set_requires_grad(self.G, True)
+
+        self.forward_AE()
+
+        self.optimizer_AE.zero_grad()
+        self.backward_AE()
+        self.optimizer_AE.step()
 
     def train(self, mode=True):
         self.G.train(mode)
@@ -408,6 +440,14 @@ class ExtractGANModel:
     def eval(self):
         self.G.eval()
         self.D.eval()
+
+    # def train_AE(self, mode=True):
+    #     self.G.eval()
+    #     self.G.encoder.train(mode=mode)
+    #     self.G.decoder.train(mode=mode)
+
+    # def eval_AE(self):
+    #     self.G.eval() 
 
     # used in test time, wrapping `forward` in no_grad() so we don't save
     # intermediate steps for backprop
